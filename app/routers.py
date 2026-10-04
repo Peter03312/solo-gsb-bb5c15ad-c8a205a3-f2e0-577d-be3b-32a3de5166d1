@@ -16,16 +16,19 @@
 - POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
 - GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
+- GET    /api/v1/devices/{device_id}/coverage      审计设备在半开区间内的校准覆盖（合规/空窗分段）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 - GET    /api/v1/revocations/{batch_id}/archive-impact  该批撤销对已交付归档凭据的影响面
 """
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from psycopg_pool import ConnectionPool
 
 from . import repository as repo
+from .errors import ApiError
 from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
@@ -164,6 +167,42 @@ def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_de
 def device_history(device_id: str, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.get_device_history(conn, device_id)
+
+
+@router.get("/devices/{device_id}/coverage")
+def device_coverage(
+    device_id: str,
+    start: str | None = Query(None, description="审计起点（含），带时区 ISO 8601"),
+    end: str | None = Query(None, description="审计终点（不含），带时区 ISO 8601；不得晚于查询时刻"),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """审计设备在半开区间 [start, end) 内的校准覆盖：按时间顺序返回完整、
+    无重叠的合规（COVERED）/空窗（GAP）片段；相邻且状态与编号相同的片段合并。"""
+    parsed: dict[str, datetime] = {}
+    bad: dict[str, str | None] = {}
+    for name, raw in (("start", start), ("end", end)):
+        if raw is None:
+            bad[name] = raw
+            continue
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            bad[name] = raw
+            continue
+        if dt.tzinfo is None:
+            bad[name] = raw
+        else:
+            parsed[name] = dt
+    if bad:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            "start 与 end 必须是带时区的 ISO 8601 时刻（如 2026-03-01T00:00:00+08:00），"
+            "且两者均必填",
+            details=bad,
+        )
+    with pool.connection() as conn:
+        return repo.get_device_coverage(conn, device_id, parsed["start"], parsed["end"])
 
 
 @router.get("/revocations")

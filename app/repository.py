@@ -116,6 +116,144 @@ def get_device_history(conn, device_id: str) -> list[dict]:
     ).fetchall()
 
 
+# ---------------------------------------------------------------------------
+# 设备校准覆盖审计（半开区间 [start, end) 内合格普通证书覆盖/空窗分段）
+# ---------------------------------------------------------------------------
+
+def _audit_validate_window(start, end, now) -> None:
+    """审计窗口参数校验：起止必须带时区、start < end，且 end 不得晚于查询时刻。
+
+    端点位于查询时刻的半开区间 [start, now) 合法（仅审计已经发生的时间）。
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            "start 与 end 必须是带时区的 ISO 8601 时刻（如 2026-03-01T00:00:00+08:00）",
+        )
+    if start >= end:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            f"审计区间必须满足 start < end（半开区间）：start={start.isoformat()} "
+            f"end={end.isoformat()}",
+            details={"start": start.isoformat(), "end": end.isoformat()},
+        )
+    if end > now:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            f"审计终点 end={end.isoformat()} 晚于查询时刻 {now.isoformat()}，"
+            "未来时间尚未发生、不可审计",
+            details={"end": end.isoformat(), "now": now.isoformat()},
+        )
+
+
+def _audit_cert_intervals(conn, device_id: str) -> list[dict]:
+    """取设备上所有“合格普通证书”在历史上真正计入覆盖的半开区间。
+
+    计入起点 = GREATEST(created_at, valid_from)：证书在签发创建时刻才存在；
+        若有效期起点晚于创建时刻，则到有效期起点证书才真正生效。
+    退出时刻 = LEAST(valid_to, 撤销/级联失效时刻)：有效期终点与失效孰先。
+    历史重签不做任何当前态推断——区间完全由该证书自己的实际签发事件
+    （created_at/valid_from）与实际失效事件（valid_to/revoked_at）还原。
+
+    上游链只需在“下游校准时刻”合格（既有签发规则），上游事后自然到期
+    不取消下游覆盖：故这里只保留结论 PASS 的普通证书自身的有效期与
+    自身失效时刻；INACTIVE 证书（被撤销或级联失效）以 revoked_at 截断，
+    FAIL 证书从不是“合格”证书，整段不计入。
+    """
+    return conn.execute(
+        """
+        SELECT cert_no,
+               GREATEST(created_at, valid_from)                  AS cover_from,
+               LEAST(valid_to, COALESCE(revoked_at, valid_to))   AS cover_to
+        FROM certificates
+        WHERE device_id = %s
+          AND kind = 'CALIBRATION'
+          AND conclusion = 'PASS'
+          AND GREATEST(created_at, valid_from)
+              < LEAST(valid_to, COALESCE(revoked_at, valid_to))
+        ORDER BY cover_from ASC, cert_no ASC
+        """,
+        (device_id,),
+    ).fetchall()
+
+
+def _build_coverage_segments(intervals: list[dict], start, end) -> list[dict]:
+    """把一组不重叠（首尾可相接）的计入区间切分为 [start, end) 上完整、
+    无重叠、按时间顺序的合规/空窗片段，并合并相邻同状态同编号片段。
+
+    半开区间约定：时刻 t 被某证书覆盖 ⇔ cover_from <= t < cover_to。
+    故事件边界只取落在 (start, end] 内的起点与落在 [start, end) 内的终点：
+    恰在 start 的起点无前置空窗，恰在 end 的终点无后置空窗。
+    """
+    boundaries = {start, end}
+    for iv in intervals:
+        cf, ct = iv["cover_from"], iv["cover_to"]
+        if start < cf <= end:
+            boundaries.add(cf)
+        if start <= ct < end:
+            boundaries.add(ct)
+    cuts = sorted(boundaries)
+
+    segments: list[dict] = []
+    for lo, hi in zip(cuts, cuts[1:]):
+        # 用元素段左端点判定归属（该点落在 [cover_from, cover_to) 内即覆盖）
+        nos = sorted(
+            iv["cert_no"] for iv in intervals
+            if iv["cover_from"] <= lo < iv["cover_to"]
+        )
+        seg = {
+            "start": lo,
+            "end": hi,
+            "status": "COVERED" if nos else "GAP",
+            "cert_nos": nos,
+        }
+        # 相邻且状态与合格证书编号集合相同的片段合并（含首尾相接）
+        if segments and segments[-1]["end"] == lo:
+            prev = segments[-1]
+            if prev["status"] == seg["status"] and prev["cert_nos"] == nos:
+                prev["end"] = hi
+                continue
+        segments.append(seg)
+    return segments
+
+
+def get_device_coverage(conn, device_id: str, start, end) -> dict:
+    """审计指定设备在半开区间 [start, end) 内的校准覆盖。
+
+    - 未知设备（无任何证书记录）返回整段单个空窗片段；
+    - 合规片段给出当时可用的合格普通证书编号（按既有签发规则，同设备
+      ACTIVE 有效期互斥，通常至多一个，仍以列表表达）；
+    - 上游证书有效期只按下游校准时刻的既有签发规则判断：上游事后自然
+      到期不取消下游覆盖，上游事后撤销则下游在同一时刻级联失效
+      （revoked_at）截断；
+    - 历史重签即使有效期与旧证重叠，也按各自实际签发/失效事件还原，
+      不以当前状态替代历史状态。
+    """
+    now = datetime.now(timezone.utc)
+    _audit_validate_window(start, end, now)
+
+    known = conn.execute(
+        "SELECT 1 FROM certificates WHERE device_id = %s LIMIT 1", (device_id,)
+    ).fetchone()
+
+    if known is None:
+        segments = [{"start": start, "end": end, "status": "GAP", "cert_nos": []}]
+    else:
+        intervals = _audit_cert_intervals(conn, device_id)
+        segments = _build_coverage_segments(intervals, start, end)
+
+    return {
+        "device_id": device_id,
+        "start": start,
+        "end": end,
+        "queried_at": now,
+        "segments": segments,
+    }
+
+
 def get_downstream(conn, cert_no: str) -> dict:
     if _get_cert_row(conn, cert_no) is None:
         raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
