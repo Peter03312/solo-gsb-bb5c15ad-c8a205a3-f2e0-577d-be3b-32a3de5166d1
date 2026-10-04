@@ -1325,3 +1325,110 @@ def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) 
         "offset": offset,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# 设备校准覆盖审计（过去半开区间内的合规/空窗片段，只读）
+# ---------------------------------------------------------------------------
+
+def get_device_coverage_audit(conn, device_id: str, qfrom: datetime, qto: datetime) -> dict:
+    """审计设备在半开区间 [from, to) 内的校准覆盖，按时间顺序返回完整、无重叠的
+    合规（COMPLIANT）与空窗（GAP）片段。
+
+    - 计入覆盖的只有该设备的合格普通证书（kind=CALIBRATION 且 conclusion=PASS）；
+    - 每张证书的计入窗口为 [max(签发创建时刻, 有效期起点),
+      min(有效期终点, 撤销/级联失效时刻))，再裁剪到审计区间；
+    - 上游证书的有效性在签发时已按下游校准时刻校验，本审计不再回溯重判：
+      上游事后到期不影响下游覆盖；上游事后撤销已通过下游证书自身的级联失效
+      时刻（certificates.revoked_at，撤销事务内与级联失效同事务写入）截断；
+    - 历史重签（撤销/失效释放区间后再签发，有效期可与原证书重叠）按各证书
+      实际的签发创建与失效事件还原，不以当前状态替代历史状态；并发交错时
+      同一时刻可能被多张证书覆盖，片段如实列出全部可用编号（升序）；
+    - 相邻且状态与证书编号集合相同的片段合并；空窗片段 cert_nos 为空列表；
+    - 未知设备（或无任何合格普通证书的设备）返回整段空窗，不报 404；
+    - 起止必须携带时区、起点必须早于终点、终点不得晚于查询时刻，否则 422；
+      响应中的时间统一为 UTC（带时区 ISO 8601，与输入为同一时刻）。
+    """
+    for label, value in (("from", qfrom), ("to", qto)):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ApiError(
+                422,
+                "invalid_audit_window",
+                "审计起止时刻必须携带时区（如 2026-03-01T09:00:00+08:00）；"
+                f"参数 {label}={value.isoformat()} 缺少时区",
+                details={
+                    "device_id": device_id,
+                    "from": qfrom.isoformat(),
+                    "to": qto.isoformat(),
+                },
+            )
+    start = qfrom.astimezone(timezone.utc)
+    end = qto.astimezone(timezone.utc)
+    if not start < end:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            "审计起点必须早于终点（半开区间 [from, to)）："
+            f"from={qfrom.isoformat()}, to={qto.isoformat()}",
+            details={
+                "device_id": device_id,
+                "from": qfrom.isoformat(),
+                "to": qto.isoformat(),
+            },
+        )
+    now = datetime.now(timezone.utc)
+    if end > now:
+        raise ApiError(
+            422,
+            "invalid_audit_window",
+            "审计终点晚于查询时刻，只能审计已经过去的区间："
+            f"to={qto.isoformat()}, now={now.isoformat()}",
+            details={
+                "device_id": device_id,
+                "from": qfrom.isoformat(),
+                "to": qto.isoformat(),
+                "now": now.isoformat(),
+            },
+        )
+
+    rows = conn.execute(
+        """
+        SELECT cert_no, valid_from, valid_to, created_at, revoked_at
+        FROM certificates
+        WHERE device_id = %s AND kind = 'CALIBRATION' AND conclusion = 'PASS'
+        ORDER BY cert_no ASC
+        """,
+        (device_id,),
+    ).fetchall()
+
+    # 每张合格普通证书的计入窗口（裁剪到审计区间后非空才参与扫描）
+    windows: list[tuple[datetime, datetime, str]] = []
+    for r in rows:
+        w_start = max(
+            r["created_at"].astimezone(timezone.utc),
+            r["valid_from"].astimezone(timezone.utc),
+        )
+        w_end = r["valid_to"].astimezone(timezone.utc)
+        if r["revoked_at"] is not None:
+            # 撤销（REVOKED）或级联失效（INVALID）时刻，二者都记录在 revoked_at
+            w_end = min(w_end, r["revoked_at"].astimezone(timezone.utc))
+        lo, hi = max(w_start, start), min(w_end, end)
+        if lo < hi:
+            windows.append((lo, hi, r["cert_no"]))
+
+    # 扫描线：审计区间端点 + 全部窗口边界；相邻边界之间的可用证书集合恒定
+    boundaries = sorted({start, end} | {b for lo, hi, _ in windows for b in (lo, hi)})
+    segments: list[dict] = []
+    for a, b in zip(boundaries, boundaries[1:]):
+        active = sorted(no for lo, hi, no in windows if lo <= a < hi)
+        status = "COMPLIANT" if active else "GAP"
+        if (
+            segments
+            and segments[-1]["status"] == status
+            and segments[-1]["cert_nos"] == active
+        ):
+            segments[-1]["to"] = b  # 相邻且状态与编号相同 → 合并
+        else:
+            segments.append({"from": a, "to": b, "status": status, "cert_nos": active})
+
+    return {"device_id": device_id, "from": start, "to": end, "segments": segments}

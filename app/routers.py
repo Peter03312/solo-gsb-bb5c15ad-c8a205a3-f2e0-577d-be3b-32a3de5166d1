@@ -16,10 +16,12 @@
 - POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
 - GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
+- GET    /api/v1/devices/{device_id}/coverage-audit  设备校准覆盖审计（合规/空窗片段）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 - GET    /api/v1/revocations/{batch_id}/archive-impact  该批撤销对已交付归档凭据的影响面
 """
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -164,6 +166,23 @@ def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_de
 def device_history(device_id: str, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.get_device_history(conn, device_id)
+
+
+@router.get("/devices/{device_id}/coverage-audit")
+def device_coverage_audit(
+    device_id: str,
+    from_: datetime = Query(
+        ..., alias="from", description="审计起点（含），带时区 ISO 8601"
+    ),
+    to: datetime = Query(
+        ..., description="审计终点（不含），带时区 ISO 8601；不得晚于查询时刻"
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """审计设备在过去半开区间 [from, to) 内的校准覆盖：按时间顺序返回完整、
+    无重叠的合规（COMPLIANT）与空窗（GAP）片段；未知设备返回整段空窗。"""
+    with pool.connection() as conn:
+        return repo.get_device_coverage_audit(conn, device_id, from_, to)
 
 
 @router.get("/revocations")
